@@ -1,0 +1,51 @@
+{
+  "url": "https://api.example.com/v1/test",
+  "cookie": "your-cookie-here",
+  "bodyTemp": "{\"key\":\"your-api-key\",\"name\":\"Test API\",\"type\":\"InterfacePage\",\"interfaceType\":\"REST\",\"active\":true,\"inputParamType\":\"string,int,array\",\"interfaceName\":\"com.example.test.TestService\",\"alias\":\"test-service\",\"method\":\"testMethod\",\"ipPort\":\"%s\",\"token\":\"\",\"callType\":0,\"jsonParam\":\"${jsonParam}\",\"serialization\":\"json\",\"serializerFeature\":\"JSON\",\"clientType\":\"generic\",\"isForceBot\":0,\"eoneEnv\":\"\",\"overtime\":\"\",\"traced\":false,\"mockType\":0,\"matchType\":\"0\",\"compareRuleInfo\":{\"presets\":[],\"compareScript\":[]},\"lineId\":12345}",
+  "ipList": [
+    "127.0.0.1:8080",
+    "192.168.1.100:8080",
+    "10.0.0.1:8080"
+  ],
+  "qps": 10,
+  "workers": 5,
+  "maxRetries": 3,
+  "paramMappings": [
+    {
+      "csvColumn": "0",
+      "paramName": "userId",
+      "paramType": "int",
+      "defaultValue": "1001",
+      "arrayIndex": 0
+    },
+    {
+      "csvColumn": "1",
+      "paramName": "userName",
+      "paramType": "string",
+      "defaultValue": "default_user",
+      "arrayIndex": 1
+    },
+    {
+      "csvColumn": "2",
+      "paramName": "tags",
+      "paramType": "string[]",
+      "defaultValue": "tag1,tag2,tag3",
+      "arrayIndex": 2
+    },
+    {
+      "csvColumn": "3",
+      "paramName": "scores",
+      "paramType": "int[]",
+      "defaultValue": "90,85,95",
+      "arrayIndex": 3
+    },
+    {
+      "csvColumn": "4",
+      "paramName": "isActive",
+      "paramType": "bool",
+      "defaultValue": "true",
+      "arrayIndex": 4
+    }
+  ],
+  "paramMode": "array"
+}

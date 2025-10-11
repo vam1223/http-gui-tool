@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>HTTP批量请求工具</title>
+    <organization>com.httptool.batchrequester</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="false"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.httptool.batchrequester.pkg"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.httptool.batchrequester.pkg" visible="false">
+        <pkg-ref id="com.httptool.batchrequester"/>
+    </choice>
+    <pkg-ref id="com.httptool.batchrequester" version="1.0.0" onConclusion="none">HTTP批量请求工具.pkg</pkg-ref>
+</installer-gui-script>
