@@ -25,6 +25,24 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// 字符串构建器池，减少内存分配
+var stringBuilderPool = sync.Pool{
+	New: func() interface{} {
+		return &strings.Builder{}
+	},
+}
+
+// 获取字符串构建器
+func getStringBuilder() *strings.Builder {
+	return stringBuilderPool.Get().(*strings.Builder)
+}
+
+// 归还字符串构建器
+func putStringBuilder(sb *strings.Builder) {
+	sb.Reset()
+	stringBuilderPool.Put(sb)
+}
+
 // 参数映射配置
 type ParamMapping struct {
 	CSVColumn    string `json:"csvColumn"`    // CSV列名或索引
@@ -103,10 +121,27 @@ type HTTPTool struct {
 	cancelFunc  context.CancelFunc
 	mutex       sync.RWMutex
 	
-	// 日志缓冲
-	logBuffer   []string
-	logMutex    sync.Mutex
-	logTicker   *time.Ticker
+	// 日志缓冲 - 优化版本
+	logBuffer     []string
+	logMutex      sync.Mutex
+	logTicker     *time.Ticker
+	logChannel    chan string
+	maxLogLines   int
+	lastUIUpdate  time.Time
+	uiUpdateMutex sync.Mutex
+	
+	// 进度更新优化
+	lastProgressUpdate time.Time
+	progressMutex      sync.Mutex
+	progressChannel    chan progressUpdate
+}
+
+// 进度更新结构
+type progressUpdate struct {
+	processed int
+	total     int
+	success   int
+	errors    int
 }
 
 
@@ -223,9 +258,13 @@ func (h *HTTPTool) setupUI() {
 	h.outputText.MultiLine = true
 	h.outputText.Wrapping = fyne.TextWrapWord
 	
-	// 初始化日志缓冲系统
-	h.logBuffer = make([]string, 0)
+	// 初始化优化的日志缓冲系统
+	h.logBuffer = make([]string, 0, 100)     // 预分配容量
+	h.logChannel = make(chan string, 200)    // 异步日志通道
+	h.maxLogLines = 200                      // 最大日志行数
+	h.progressChannel = make(chan progressUpdate, 50) // 进度更新通道
 	h.setupLogBuffer()
+	h.setupProgressUpdater()
 
 	// 创建进度条和状态标签
 	h.progressBar = widget.NewProgressBar()
@@ -538,12 +577,8 @@ func (h *HTTPTool) executeRequests(ctx context.Context) {
 			h.appendLog(fmt.Sprintf("Row %d param generation failed: %v", rowIndex, err))
 			errorCount++
 			processedCount++
-			// 更新进度 - 在UI线程中执行
-			fyne.Do(func() {
-				progress := float64(processedCount) / float64(totalRows)
-				h.progressBar.SetValue(progress)
-				h.statusLabel.SetText(fmt.Sprintf("处理中... %d/%d (%.1f%%)", processedCount, totalRows, progress*100))
-			})
+			// 使用优化的异步进度更新
+			h.updateProgress(processedCount, totalRows, successCount, errorCount)
 			continue
 		}
 
@@ -555,18 +590,17 @@ func (h *HTTPTool) executeRequests(ctx context.Context) {
 		successCount++
 		processedCount++
 		
-		// 更新进度 - 在UI线程中执行
-		fyne.Do(func() {
-			progress := float64(processedCount) / float64(totalRows)
-			h.progressBar.SetValue(progress)
-			h.statusLabel.SetText(fmt.Sprintf("处理中... %d/%d (%.1f%%)", processedCount, totalRows, progress*100))
-		})
+		// 使用优化的异步进度更新，减少UI线程压力
+		h.updateProgress(processedCount, totalRows, successCount, errorCount)
 	}
 
 	close(requestQueue)
 	wg.Wait()
 	
-	// 完成后更新状态 - 在UI线程中执行
+	// 完成后更新状态 - 使用优化的异步更新
+	h.updateProgress(totalRows, totalRows, successCount, errorCount)
+	
+	// 最终状态更新
 	fyne.Do(func() {
 		h.progressBar.SetValue(1.0)
 		h.statusLabel.SetText(fmt.Sprintf("执行完成 - 成功: %d, 错误: %d", successCount, errorCount))
@@ -837,79 +871,162 @@ func (h *HTTPTool) setHeaders(req *http.Request) {
 	}
 }
 
-// 设置日志缓冲系统
+// 设置优化的日志缓冲系统
 func (h *HTTPTool) setupLogBuffer() {
-	// 每200毫秒批量更新一次日志
-	h.logTicker = time.NewTicker(200 * time.Millisecond)
+	// 使用更长的间隔减少UI更新频率
+	h.logTicker = time.NewTicker(500 * time.Millisecond)
+	
+	// 启动异步日志处理器
 	go func() {
-		for range h.logTicker.C {
-			h.flushLogBuffer()
+		for {
+			select {
+			case logMsg := <-h.logChannel:
+				h.logMutex.Lock()
+				h.logBuffer = append(h.logBuffer, logMsg)
+				
+				// 限制缓冲区大小，避免内存无限增长
+				if len(h.logBuffer) > h.maxLogLines {
+					// 保留最新的日志
+					copy(h.logBuffer, h.logBuffer[len(h.logBuffer)-h.maxLogLines+50:])
+					h.logBuffer = h.logBuffer[:h.maxLogLines-50]
+				}
+				h.logMutex.Unlock()
+				
+			case <-h.logTicker.C:
+				h.flushLogBuffer()
+			}
 		}
 	}()
 }
 
-// 刷新日志缓冲到UI
+// 设置进度更新处理器
+func (h *HTTPTool) setupProgressUpdater() {
+	go func() {
+		for update := range h.progressChannel {
+			// 限制进度更新频率，避免UI过载
+			h.progressMutex.Lock()
+			now := time.Now()
+			if now.Sub(h.lastProgressUpdate) < 200*time.Millisecond {
+				h.progressMutex.Unlock()
+				continue
+			}
+			h.lastProgressUpdate = now
+			h.progressMutex.Unlock()
+			
+			// 异步更新进度UI
+			go func(u progressUpdate) {
+				fyne.Do(func() {
+					progress := float64(u.processed) / float64(u.total)
+					h.progressBar.SetValue(progress)
+					h.statusLabel.SetText(fmt.Sprintf("处理中... %d/%d (%.1f%%) - 成功: %d, 错误: %d",
+						u.processed, u.total, progress*100, u.success, u.errors))
+				})
+			}(update)
+		}
+	}()
+}
+
+// 优化的进度更新函数
+func (h *HTTPTool) updateProgress(processed, total, success, errors int) {
+	select {
+	case h.progressChannel <- progressUpdate{
+		processed: processed,
+		total:     total,
+		success:   success,
+		errors:    errors,
+	}:
+		// 成功发送进度更新
+	default:
+		// 通道满了，跳过这次更新，避免阻塞
+	}
+}
+
+// 优化的日志刷新函数 - 减少UI阻塞
 func (h *HTTPTool) flushLogBuffer() {
-	h.logMutex.Lock()
+	// 防止过于频繁的UI更新
+	h.uiUpdateMutex.Lock()
+	now := time.Now()
+	if now.Sub(h.lastUIUpdate) < 300*time.Millisecond {
+		h.uiUpdateMutex.Unlock()
+		return
+	}
+	h.lastUIUpdate = now
+	h.uiUpdateMutex.Unlock()
 	
+	h.logMutex.Lock()
 	if len(h.logBuffer) == 0 {
 		h.logMutex.Unlock()
 		return
 	}
 	
-	// 复制缓冲区内容并清空
-	logs := make([]string, len(h.logBuffer))
-	copy(logs, h.logBuffer)
+	// 只取最新的日志进行更新，避免处理过多历史日志
+	var logsToUpdate []string
+	bufferLen := len(h.logBuffer)
+	if bufferLen > 50 {
+		// 只取最新50条日志更新UI
+		logsToUpdate = make([]string, 50)
+		copy(logsToUpdate, h.logBuffer[bufferLen-50:])
+	} else {
+		logsToUpdate = make([]string, bufferLen)
+		copy(logsToUpdate, h.logBuffer)
+	}
+	
+	// 清空缓冲区
 	h.logBuffer = h.logBuffer[:0]
 	h.logMutex.Unlock()
 	
-	// 在UI线程中更新界面
-	fyne.Do(func() {
-		currentText := h.outputText.Text
-		newLogs := strings.Join(logs, "")
-		updatedText := currentText + newLogs
-		
-		// 限制日志只保留最近100条
-		lines := strings.Split(updatedText, "\n")
-		if len(lines) > 100 {
-			// 保留最后100条非空行
-			var validLines []string
-			for _, line := range lines {
-				if strings.TrimSpace(line) != "" {
-					validLines = append(validLines, line)
+	// 异步更新UI，避免阻塞
+	go func() {
+		fyne.Do(func() {
+			// 使用字符串构建器池减少内存分配
+			builder := getStringBuilder()
+			defer putStringBuilder(builder)
+			
+			currentText := h.outputText.Text
+			
+			// 限制显示的总行数，避免文本过长导致性能问题
+			lines := strings.Split(currentText, "\n")
+			if len(lines) > 150 {
+				// 只保留最新100行
+				lines = lines[len(lines)-100:]
+				for i, line := range lines {
+					if i > 0 {
+						builder.WriteString("\n")
+					}
+					builder.WriteString(line)
 				}
+				builder.WriteString("\n")
+			} else {
+				builder.WriteString(currentText)
 			}
 			
-			if len(validLines) > 100 {
-				validLines = validLines[len(validLines)-100:]
+			// 添加新日志
+			for _, log := range logsToUpdate {
+				builder.WriteString(log)
 			}
 			
-			// 重新组合文本，最后加一个空行
-			updatedText = strings.Join(validLines, "\n") + "\n"
-		}
-		
-		h.outputText.SetText(updatedText)
-		
-		// 自动滚动到底部
-		h.outputText.CursorRow = len(strings.Split(h.outputText.Text, "\n"))
-		h.outputText.Refresh()
-	})
+			h.outputText.SetText(builder.String())
+			
+			// 优化滚动：只在有新内容时滚动
+			if len(logsToUpdate) > 0 {
+				h.outputText.CursorRow = len(strings.Split(h.outputText.Text, "\n"))
+			}
+		})
+	}()
 }
 
-// 优化后的日志添加函数
+// 高性能异步日志添加函数
 func (h *HTTPTool) appendLog(message string) {
 	timestamp := time.Now().Format("15:04:05")
 	logMessage := fmt.Sprintf("[%s] %s\n", timestamp, message)
 	
-	h.logMutex.Lock()
-	h.logBuffer = append(h.logBuffer, logMessage)
-	
-	// 如果缓冲区太大，立即刷新
-	if len(h.logBuffer) > 50 {
-		h.logMutex.Unlock()
-		h.flushLogBuffer()
-	} else {
-		h.logMutex.Unlock()
+	// 使用非阻塞发送，避免goroutine阻塞
+	select {
+	case h.logChannel <- logMessage:
+		// 成功发送到通道
+	default:
+		// 通道满了，丢弃旧日志，避免阻塞
+		// 这种情况下优先保证程序响应性
 	}
 }
 
@@ -918,6 +1035,14 @@ func (h *HTTPTool) stopLogBuffer() {
 	if h.logTicker != nil {
 		h.logTicker.Stop()
 		h.flushLogBuffer() // 最后刷新一次
+	}
+	
+	// 关闭通道，避免goroutine泄漏
+	if h.logChannel != nil {
+		close(h.logChannel)
+	}
+	if h.progressChannel != nil {
+		close(h.progressChannel)
 	}
 }
 
