@@ -25,6 +25,21 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// 自定义HTTP客户端，带连接池和超时设置
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second, // 请求总超时
+	Transport: &http.Transport{
+		MaxIdleConns:        100,              // 最大空闲连接数
+		MaxIdleConnsPerHost: 20,               // 每个主机的最大空闲连接数
+		MaxConnsPerHost:     50,               // 每个主机的最大连接数
+		IdleConnTimeout:     90 * time.Second, // 空闲连接超时
+		TLSHandshakeTimeout: 10 * time.Second, // TLS握手超时
+		DisableCompression:  false,            // 启用压缩
+		ForceAttemptHTTP2:   true,             // 尝试使用HTTP/2
+		DisableKeepAlives:   false,            // 启用连接复用
+	},
+}
+
 // 字符串构建器池，减少内存分配
 var stringBuilderPool = sync.Pool{
 	New: func() interface{} {
@@ -507,34 +522,50 @@ func (h *HTTPTool) executeRequests(ctx context.Context) {
 
 	reader := csv.NewReader(file)
 
-	// 创建请求队列和限流器
-	requestQueue := make(chan RequestTask, 100)
+	// 创建请求队列和限流器 - 优化队列大小
+	requestQueue := make(chan RequestTask, workers*2) // 根据worker数量调整队列大小
 	rateLimiter := time.NewTicker(time.Second / time.Duration(qps))
 	defer rateLimiter.Stop()
 
+	// 创建错误通道用于收集错误信息
+	errorChan := make(chan error, workers)
 	var wg sync.WaitGroup
 
-	// Start worker goroutines
+	// Start worker goroutines - 优化worker管理，增强停止响应
 	for i := 0; i < workers; i++ {
-		go func() {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					select {
+					case errorChan <- fmt.Errorf("worker %d panic: %v", workerID, r):
+					case <-ctx.Done():
+					}
+				}
+			}()
+			
 			for {
 				select {
+				case <-ctx.Done():
+					return // 优先检查取消信号
 				case task, ok := <-requestQueue:
 					if !ok {
 						return
 					}
-					<-rateLimiter.C
-					h.sendRequest(ctx, task, ipList, maxRetries)
-					wg.Done()
-				case <-ctx.Done():
-					return
+					select {
+					case <-ctx.Done():
+						return // 在限流前再次检查
+					case <-rateLimiter.C:
+						h.sendRequest(ctx, task, ipList, maxRetries)
+					}
 				}
 			}
-		}()
+		}(i)
 	}
 
-	// 先读取所有行以计算总数
-	allRows := [][]string{}
+	// 先读取所有行以计算总数 - 优化内存使用
+	allRows := make([][]string, 0, 1000) // 预分配容量
 	for {
 		row, err := reader.Read()
 		if err != nil {
@@ -546,25 +577,46 @@ func (h *HTTPTool) executeRequests(ctx context.Context) {
 	totalRows := len(allRows) - 1 // 减去标题行
 	if totalRows <= 0 {
 		h.appendLog("CSV文件没有数据行")
+		close(requestQueue)
+		wg.Wait()
 		return
 	}
 	
 	h.appendLog(fmt.Sprintf("Found %d data rows to process", totalRows))
 	
-	// Read and process CSV
+	// 处理CSV数据 - 优化处理逻辑
 	rowIndex := 0
 	successCount := 0
 	errorCount := 0
 	processedCount := 0
+	batchSize := 100 // 增加批量处理大小，减少UI更新频率
+	
+	// 启动错误监控goroutine
+	go func() {
+		for err := range errorChan {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				h.appendLog(fmt.Sprintf("Worker error: %v", err))
+			}
+		}
+	}()
 
-	for _, row := range allRows {
-		select {
-		case <-ctx.Done():
-			h.appendLog("Execution cancelled")
-			close(requestQueue)
-			wg.Wait()
-			return
-		default:
+	// 使用更高效的循环，定期检查停止信号
+	checkInterval := 10 // 每10行检查一次停止信号
+	for i, row := range allRows {
+		// 定期检查停止信号，避免处理过多数据
+		if i%checkInterval == 0 {
+			select {
+			case <-ctx.Done():
+				h.appendLog("Execution cancelled during processing")
+				close(requestQueue)
+				wg.Wait()
+				close(errorChan)
+				return
+			default:
+			}
 		}
 
 		rowIndex++
@@ -577,30 +629,51 @@ func (h *HTTPTool) executeRequests(ctx context.Context) {
 			h.appendLog(fmt.Sprintf("Row %d param generation failed: %v", rowIndex, err))
 			errorCount++
 			processedCount++
-			// 使用优化的异步进度更新
-			h.updateProgress(processedCount, totalRows, successCount, errorCount)
+			// 错误时也检查停止信号
+			select {
+			case <-ctx.Done():
+				h.appendLog("Execution cancelled during error handling")
+				close(requestQueue)
+				wg.Wait()
+				close(errorChan)
+				return
+			default:
+				if processedCount%batchSize == 0 || processedCount == totalRows {
+					h.updateProgress(processedCount, totalRows, successCount, errorCount)
+				}
+			}
 			continue
 		}
 
-		wg.Add(1)
-		requestQueue <- RequestTask{
+		// 批量发送任务，减少channel操作开销
+		select {
+		case <-ctx.Done():
+			h.appendLog("Execution cancelled before sending task")
+			close(requestQueue)
+			wg.Wait()
+			close(errorChan)
+			return
+		case requestQueue <- RequestTask{
 			ParamsJSON: paramsJSON,
 			RowIndex:   rowIndex,
+		}:
+			successCount++
+			processedCount++
 		}
-		successCount++
-		processedCount++
 		
-		// 使用优化的异步进度更新，减少UI线程压力
-		h.updateProgress(processedCount, totalRows, successCount, errorCount)
+		// 批量更新进度，减少UI更新频率
+		if processedCount%batchSize == 0 || processedCount == totalRows {
+			h.updateProgress(processedCount, totalRows, successCount, errorCount)
+		}
 	}
 
 	close(requestQueue)
 	wg.Wait()
-	
-	// 完成后更新状态 - 使用优化的异步更新
-	h.updateProgress(totalRows, totalRows, successCount, errorCount)
+	close(errorChan)
 	
 	// 最终状态更新
+	h.updateProgress(totalRows, totalRows, successCount, errorCount)
+	
 	fyne.Do(func() {
 		h.progressBar.SetValue(1.0)
 		h.statusLabel.SetText(fmt.Sprintf("执行完成 - 成功: %d, 错误: %d", successCount, errorCount))
@@ -794,28 +867,54 @@ func (h *HTTPTool) convertValueByType(value, paramType string) (interface{}, err
 
 func (h *HTTPTool) sendRequest(ctx context.Context, task RequestTask, ipList []string, maxRetries int) {
 	retryCount := 0
+	startTime := time.Now()
+	
+	// 预编译body模板，避免重复解析
+	var bodyTemplate map[string]interface{}
+	if err := json.Unmarshal([]byte(h.bodyEntry.Text), &bodyTemplate); err != nil {
+		h.appendLog(fmt.Sprintf("Row %d body template parse failed: %v", task.RowIndex, err))
+		return
+	}
 	
 	for retryCount < maxRetries {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		} 
+		// 为每次重试添加指数退避延迟，避免惊群效应
+		if retryCount > 0 {
+			backoffDelay := time.Duration(retryCount*retryCount*100) * time.Millisecond
+			if backoffDelay > 5*time.Second {
+				backoffDelay = 5 * time.Second
+			}
+			time.Sleep(backoffDelay)
 		}
 
 		// 选择IP
 		randomIP := ipList[task.RowIndex%len(ipList)]
 
-		// 构造请求体
-		var data map[string]interface{}
-		json.Unmarshal([]byte(h.bodyEntry.Text), &data)
+		// 构造请求体 - 使用模板副本避免并发问题
+		data := make(map[string]interface{})
+		for k, v := range bodyTemplate {
+			data[k] = v
+		}
 		data["ipPort"] = randomIP
 		data["jsonParam"] = string(task.ParamsJSON)
 
-		body, _ := json.Marshal(data)
-
-		// 创建请求
-		req, err := http.NewRequestWithContext(ctx, "POST", h.urlEntry.Text, bytes.NewReader(body))
+		body, err := json.Marshal(data)
 		if err != nil {
+			h.appendLog(fmt.Sprintf("Row %d JSON marshal failed: %v", task.RowIndex, err))
+			return
+		}
+
+		// 创建带超时的子上下文
+		reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		
+		// 创建请求 - 使用bytes.NewBuffer避免重复分配
+		req, err := http.NewRequestWithContext(reqCtx, "POST", h.urlEntry.Text, bytes.NewBuffer(body))
+		if err != nil {
+			cancel()
 			h.appendLog(fmt.Sprintf("Row %d request creation failed: %v", task.RowIndex, err))
 			return
 		}
@@ -823,15 +922,22 @@ func (h *HTTPTool) sendRequest(ctx context.Context, task RequestTask, ipList []s
 		// 设置请求头
 		h.setHeaders(req)
 
-		// 发送请求
-		resp, err := http.DefaultClient.Do(req)
+		// 发送请求 - 使用优化的HTTP客户端
+		requestStart := time.Now()
+		resp, err := httpClient.Do(req)
+		requestDuration := time.Since(requestStart)
+		cancel() // 立即取消上下文，释放资源
+		
 		if err != nil {
 			retryCount++
-			h.appendLog(fmt.Sprintf("Row %d request failed (retry %d/%d): %v", task.RowIndex, retryCount, maxRetries, err))
+			h.appendLog(fmt.Sprintf("Row %d request failed (retry %d/%d, duration: %v): %v",
+				task.RowIndex, retryCount, maxRetries, requestDuration, err))
 			continue
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		// 优化响应读取 - 限制响应大小避免内存问题
+		const maxResponseSize = 5 * 1024 * 1024 // 5MB限制，减少内存使用
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 		resp.Body.Close()
 		
 		if err != nil {
@@ -840,17 +946,33 @@ func (h *HTTPTool) sendRequest(ctx context.Context, task RequestTask, ipList []s
 			continue
 		}
 
+		// 检查响应状态码
+		if resp.StatusCode >= 500 {
+			retryCount++
+			h.appendLog(fmt.Sprintf("Row %d server error %d (retry %d/%d)", task.RowIndex, resp.StatusCode, retryCount, maxRetries))
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			// 4xx错误不重试，直接记录为失败
+			h.appendLog(fmt.Sprintf("Row %d client error %d: %s", task.RowIndex, resp.StatusCode, string(respBody)))
+			return
+		}
+
 		if strings.Contains(string(respBody), "call failed") {
 			retryCount++
 			h.appendLog(fmt.Sprintf("第%d行call failed(重试%d/%d): %s", task.RowIndex, retryCount, maxRetries, string(respBody)))
 			continue
 		}
 
-		h.appendLog(fmt.Sprintf("Row %d success: %s", task.RowIndex, string(respBody)))
+		// 记录成功响应和耗时
+		totalDuration := time.Since(startTime)
+		h.appendLog(fmt.Sprintf("Row %d success in %v (request: %v): %s",
+			task.RowIndex, totalDuration, requestDuration, string(respBody)))
 		return
 	}
 	
-	h.appendLog(fmt.Sprintf("Row %d final failure, max retries reached", task.RowIndex))
+	h.appendLog(fmt.Sprintf("Row %d final failure after %d retries, total time: %v", task.RowIndex, maxRetries, time.Since(startTime)))
 }
 
 func (h *HTTPTool) setHeaders(req *http.Request) {
@@ -873,8 +995,8 @@ func (h *HTTPTool) setHeaders(req *http.Request) {
 
 // 设置优化的日志缓冲系统
 func (h *HTTPTool) setupLogBuffer() {
-	// 使用更长的间隔减少UI更新频率
-	h.logTicker = time.NewTicker(500 * time.Millisecond)
+	// 使用更长的间隔减少UI更新频率 - 增加到1秒
+	h.logTicker = time.NewTicker(1000 * time.Millisecond)
 	
 	// 启动异步日志处理器
 	go func() {
@@ -887,8 +1009,8 @@ func (h *HTTPTool) setupLogBuffer() {
 				// 限制缓冲区大小，避免内存无限增长
 				if len(h.logBuffer) > h.maxLogLines {
 					// 保留最新的日志
-					copy(h.logBuffer, h.logBuffer[len(h.logBuffer)-h.maxLogLines+50:])
-					h.logBuffer = h.logBuffer[:h.maxLogLines-50]
+					copy(h.logBuffer, h.logBuffer[len(h.logBuffer)-h.maxLogLines+20:])
+					h.logBuffer = h.logBuffer[:h.maxLogLines-20]
 				}
 				h.logMutex.Unlock()
 				
@@ -903,10 +1025,10 @@ func (h *HTTPTool) setupLogBuffer() {
 func (h *HTTPTool) setupProgressUpdater() {
 	go func() {
 		for update := range h.progressChannel {
-			// 限制进度更新频率，避免UI过载
+			// 进一步限制进度更新频率，避免UI过载 - 增加到500ms
 			h.progressMutex.Lock()
 			now := time.Now()
-			if now.Sub(h.lastProgressUpdate) < 200*time.Millisecond {
+			if now.Sub(h.lastProgressUpdate) < 500*time.Millisecond {
 				h.progressMutex.Unlock()
 				continue
 			}
@@ -918,7 +1040,8 @@ func (h *HTTPTool) setupProgressUpdater() {
 				fyne.Do(func() {
 					progress := float64(u.processed) / float64(u.total)
 					h.progressBar.SetValue(progress)
-					h.statusLabel.SetText(fmt.Sprintf("处理中... %d/%d (%.1f%%) - 成功: %d, 错误: %d",
+					// 简化状态文本，减少UI计算
+					h.statusLabel.SetText(fmt.Sprintf("%d/%d (%.0f%%) 成功:%d 错误:%d",
 						u.processed, u.total, progress*100, u.success, u.errors))
 				})
 			}(update)
@@ -941,12 +1064,12 @@ func (h *HTTPTool) updateProgress(processed, total, success, errors int) {
 	}
 }
 
-// 优化的日志刷新函数 - 减少UI阻塞
+// 优化的日志刷新函数 - 严格减少UI阻塞
 func (h *HTTPTool) flushLogBuffer() {
-	// 防止过于频繁的UI更新
+	// 防止过于频繁的UI更新 - 增加到500ms
 	h.uiUpdateMutex.Lock()
 	now := time.Now()
-	if now.Sub(h.lastUIUpdate) < 300*time.Millisecond {
+	if now.Sub(h.lastUIUpdate) < 500*time.Millisecond {
 		h.uiUpdateMutex.Unlock()
 		return
 	}
@@ -959,13 +1082,13 @@ func (h *HTTPTool) flushLogBuffer() {
 		return
 	}
 	
-	// 只取最新的日志进行更新，避免处理过多历史日志
+	// 只取最新的日志进行更新，减少处理量
 	var logsToUpdate []string
 	bufferLen := len(h.logBuffer)
-	if bufferLen > 50 {
-		// 只取最新50条日志更新UI
-		logsToUpdate = make([]string, 50)
-		copy(logsToUpdate, h.logBuffer[bufferLen-50:])
+	if bufferLen > 20 { // 减少到20条，避免UI处理过多数据
+		// 只取最新20条日志更新UI
+		logsToUpdate = make([]string, 20)
+		copy(logsToUpdate, h.logBuffer[bufferLen-20:])
 	} else {
 		logsToUpdate = make([]string, bufferLen)
 		copy(logsToUpdate, h.logBuffer)
@@ -984,11 +1107,11 @@ func (h *HTTPTool) flushLogBuffer() {
 			
 			currentText := h.outputText.Text
 			
-			// 限制显示的总行数，避免文本过长导致性能问题
+			// 进一步限制显示的总行数，避免文本过长导致性能问题
 			lines := strings.Split(currentText, "\n")
-			if len(lines) > 150 {
-				// 只保留最新100行
-				lines = lines[len(lines)-100:]
+			if len(lines) > 100 { // 减少到100行
+				// 只保留最新80行
+				lines = lines[len(lines)-80:]
 				for i, line := range lines {
 					if i > 0 {
 						builder.WriteString("\n")
@@ -1000,17 +1123,14 @@ func (h *HTTPTool) flushLogBuffer() {
 				builder.WriteString(currentText)
 			}
 			
-			// 添加新日志
+			// 批量添加新日志，减少SetText调用次数
 			for _, log := range logsToUpdate {
 				builder.WriteString(log)
+				builder.WriteString("\n")
 			}
 			
+			// 只更新文本，不自动滚动，减少UI操作
 			h.outputText.SetText(builder.String())
-			
-			// 优化滚动：只在有新内容时滚动
-			if len(logsToUpdate) > 0 {
-				h.outputText.CursorRow = len(strings.Split(h.outputText.Text, "\n"))
-			}
 		})
 	}()
 }
